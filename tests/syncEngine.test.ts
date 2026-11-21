@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from 'vitest';
-import { SyncEngine, SyncMessage } from '../src/sync/syncEngine';
+import { describe, it, expect } from 'vitest';
+import { SyncEngine } from '../src/sync/syncEngine';
 import { AppState } from '../src/core/types';
 
 describe('SyncEngine', () => {
@@ -45,7 +45,7 @@ describe('SyncEngine', () => {
       timestamp: Date.now(),
       state: { ...dummyState, eventStartTime: '10:00' }
     });
-    expect(receivedState?.eventStartTime).toBe('09:00');
+    expect((receivedState as AppState | null)?.eventStartTime).toBe('09:00');
   });
 
   it('registers and tracks active peer heartbeats', () => {
