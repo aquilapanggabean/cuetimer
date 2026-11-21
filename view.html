@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CueTimer - Stage View</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    :root {
+      --bg: #09090B;
+      --surface: #111113;
+      --zinc-300: #D4D4D8;
+      --zinc-400: #A1A1AA;
+      --zinc-500: #71717A;
+      --white: #FAFAFA;
+      --emerald: #10B981;
+      --amber: #F59E0B;
+      --red: #EF4444;
+      --blue: #60A5FA;
+      --font-mono: 'DM Mono', 'Courier New', monospace;
+      --font-sans: 'DM Sans', system-ui, sans-serif;
+    }
+
+    html, body {
+      height: 100%;
+      width: 100%;
+      background: var(--bg);
+      color: var(--white);
+      font-family: var(--font-sans);
+      overflow: hidden;
+    }
+
+    /* ── Layout skeleton ───────────────────────────────────────────── */
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      width: 100vw;
+    }
+
+    /* ── Zone 1: Header strip ──────────────────────────────────────── */
+
+    #header {
+      flex: 0 0 60px;
+      background: var(--surface);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      border-bottom: 1px solid #27272A;
+    }
+
+    #header-left {
+      flex: 1;
+      min-width: 0;
+    }
+
+    #event-title-display {
+      font-family: var(--font-sans);
+      font-size: 16px;
+      color: var(--zinc-400);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #header-center {
+      flex: 0 0 auto;
+      text-align: center;
+    }
+
+    #live-clock {
+      font-family: var(--font-mono);
+      font-size: 28px;
+      color: var(--white);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0;
+      line-height: 1;
+    }
+
+    #header-right {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 16px;
+    }
+
+    .elapsed-block {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+    }
+
+    .elapsed-label {
+      font-family: var(--font-sans);
+      font-size: 10px;
+      color: var(--zinc-500);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      line-height: 1;
+      margin-bottom: 2px;
+    }
+
+    #event-elapsed-display {
+      font-family: var(--font-mono);
+      font-size: 20px;
+      color: var(--zinc-300);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0;
+      line-height: 1;
+    }
+
+    #schedule-variance {
+      font-family: var(--font-sans);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+
+    #schedule-variance.on-time {
+      color: var(--emerald);
+      background: rgba(16, 185, 129, 0.12);
+    }
+
+    #schedule-variance.behind {
+      color: var(--amber);
+      background: rgba(245, 158, 11, 0.12);
+    }
+
+    #schedule-variance.ahead {
+      color: var(--blue);
+      background: rgba(96, 165, 250, 0.12);
+    }
+
+    /* ── Zone 2: Hero timer area ───────────────────────────────────── */
+
+    #hero {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 48px;
+      border: 2px solid transparent;
+      transition: border-color 0.4s ease;
+      position: relative;
+    }
+
+    #hero.overtime-active {
+      border-color: rgba(239, 68, 68, 0.4);
+      animation: overtime-pulse 2s infinite;
+    }
+
+    @keyframes overtime-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+      50% { box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.6); }
+    }
+
+    /* idle/ended hero states */
+    #hero.state-idle,
+    #hero.state-ended {
+      text-align: center;
+    }
+
+    #cue-title {
+      font-family: var(--font-sans);
+      font-size: 38px;
+      font-weight: 600;
+      color: var(--white);
+      text-align: center;
+      max-width: 90vw;
+      line-height: 1.2;
+      margin-bottom: 10px;
+    }
+
+    #speaker-name {
+      font-family: var(--font-sans);
+      font-size: 20px;
+      color: var(--zinc-400);
+      text-align: center;
+      margin-bottom: 24px;
+    }
+
+    #overtime-badge {
+      font-family: var(--font-sans);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.15em;
+      color: var(--red);
+      text-transform: uppercase;
+      margin-bottom: 8px;
+      display: none;
+    }
+
+    #overtime-badge.visible {
+      display: block;
+    }
+
+    #timer-region {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: 100%;
+    }
+
+    #timer-display {
+      font-family: var(--font-mono);
+      font-size: 190px;
+      font-weight: 400;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0;
+      line-height: 1;
+      color: var(--white);
+      transition: color 0.3s ease;
+      text-align: center;
+    }
+
+    #timer-display.state-warning {
+      color: var(--amber);
+    }
+
+    #timer-display.state-critical,
+    #timer-display.state-overtime {
+      color: var(--red);
+    }
+
+    #progress-bar-wrap {
+      width: 100%;
+      max-width: 1200px;
+      height: 8px;
+      background: #27272A;
+      margin-top: 20px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    #progress-bar-fill {
+      height: 100%;
+      width: 100%;
+      background: var(--emerald);
+      transition: width 0.1s linear, background-color 0.3s ease;
+      transform-origin: left center;
+    }
+
+    #progress-bar-fill.state-warning {
+      background: var(--amber);
+    }
+
+    #progress-bar-fill.state-critical,
+    #progress-bar-fill.state-overtime {
+      background: var(--red);
+    }
+
+    /* Idle / Ended hero content */
+
+    #idle-content {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+    }
+
+    #idle-content.visible {
+      display: flex;
+    }
+
+    #idle-event-title {
+      font-family: var(--font-sans);
+      font-size: 40px;
+      font-weight: 600;
+      color: var(--white);
+      text-align: center;
+    }
+
+    #idle-clock {
+      font-family: var(--font-mono);
+      font-size: 80px;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0;
+      color: var(--white);
+    }
+
+    #idle-subtext {
+      font-family: var(--font-sans);
+      font-size: 20px;
+      color: var(--zinc-400);
+    }
+
+    #ended-content {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+    }
+
+    #ended-content.visible {
+      display: flex;
+    }
+
+    #ended-label {
+      font-family: var(--font-sans);
+      font-size: 48px;
+      font-weight: 700;
+      color: var(--white);
+    }
+
+    #ended-elapsed {
+      font-family: var(--font-mono);
+      font-size: 60px;
+      font-variant-numeric: tabular-nums;
+      color: var(--zinc-300);
+    }
+
+    #ended-variance {
+      font-family: var(--font-sans);
+      font-size: 20px;
+      color: var(--zinc-400);
+    }
+
+    /* Running hero content */
+    #running-content {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      width: 100%;
+    }
+
+    #running-content.visible {
+      display: flex;
+    }
+
+    /* ── Zone 3: Bottom status bar ─────────────────────────────────── */
+
+    #status-bar {
+      flex: 0 0 80px;
+      background: var(--surface);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      border-top: 1px solid #27272A;
+    }
+
+    .status-section {
+      flex: 1;
+    }
+
+    .status-section.center {
+      text-align: center;
+    }
+
+    .status-section.right {
+      text-align: right;
+    }
+
+    .status-label {
+      font-family: var(--font-sans);
+      font-size: 10px;
+      color: var(--zinc-500);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 4px;
+    }
+
+    #up-next-title {
+      font-family: var(--font-sans);
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--white);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 280px;
+    }
+
+    #up-next-speaker {
+      font-family: var(--font-sans);
+      font-size: 13px;
+      color: var(--zinc-400);
+    }
+
+    #cue-progress-pill {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: 15px;
+      color: var(--zinc-300);
+      font-variant-numeric: tabular-nums;
+      background: #1C1C1F;
+      border-radius: 4px;
+      padding: 4px 12px;
+    }
+
+    #ends-at {
+      font-family: var(--font-mono);
+      font-size: 18px;
+      font-variant-numeric: tabular-nums;
+      color: var(--zinc-300);
+    }
+
+    #ends-at-label {
+      font-family: var(--font-sans);
+      font-size: 10px;
+      color: var(--zinc-500);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 4px;
+    }
+
+    /* ── Fullscreen button ─────────────────────────────────────────── */
+
+    #fullscreen-btn {
+      position: fixed;
+      bottom: 90px;
+      right: 16px;
+      font-family: var(--font-sans);
+      font-size: 12px;
+      color: var(--zinc-500);
+      background: transparent;
+      border: 1px solid #3F3F46;
+      border-radius: 4px;
+      padding: 5px 10px;
+      cursor: pointer;
+      transition: color 0.2s, border-color 0.2s;
+      z-index: 10;
+    }
+
+    #fullscreen-btn:hover {
+      color: var(--zinc-300);
+      border-color: var(--zinc-500);
+    }
+
+    /* ── Flash message overlay ─────────────────────────────────────── */
+
+    #flash-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.85);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #flash-overlay.visible {
+      display: flex;
+    }
+
+    #flash-message-text {
+      font-family: var(--font-sans);
+      font-size: 52px;
+      font-weight: 600;
+      color: var(--white);
+      text-align: center;
+      max-width: 80vw;
+      line-height: 1.3;
+    }
+
+    #flash-message-text.blink {
+      animation: flash-blink 1s ease-in-out infinite;
+    }
+
+    @keyframes flash-blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    #flash-close-btn {
+      position: absolute;
+      top: 20px;
+      right: 24px;
+      font-family: var(--font-sans);
+      font-size: 28px;
+      font-weight: 400;
+      color: var(--zinc-400);
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      line-height: 1;
+      padding: 4px 8px;
+      transition: color 0.15s;
+    }
+
+    #flash-close-btn:hover {
+      color: var(--white);
+    }
+
+    /* ── Responsive font scaling ───────────────────────────────────── */
+
+    @media (max-width: 1200px) {
+      #timer-display { font-size: 150px; }
+    }
+
+    @media (max-width: 900px) {
+      #timer-display { font-size: 110px; }
+      #cue-title { font-size: 28px; }
+    }
+
+    @media (max-width: 600px) {
+      #timer-display { font-size: 72px; }
+      #cue-title { font-size: 22px; }
+      #live-clock { font-size: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+
+    <!-- Zone 1: Header -->
+    <header id="header" role="banner">
+      <div id="header-left">
+        <div id="event-title-display">My Event</div>
+      </div>
+      <div id="header-center">
+        <div id="live-clock" aria-label="Current time">00:00:00</div>
+      </div>
+      <div id="header-right">
+        <div class="elapsed-block">
+          <span class="elapsed-label">Elapsed</span>
+          <div id="event-elapsed-display" aria-label="Event elapsed time">00:00:00</div>
+        </div>
+        <div id="schedule-variance" class="on-time" role="status" aria-live="polite">On Time</div>
+      </div>
+    </header>
+
+    <!-- Zone 2: Hero timer area -->
+    <main id="hero" role="main">
+
+      <!-- Idle state -->
+      <div id="idle-content" class="visible" aria-live="polite">
+        <div id="idle-event-title">My Event</div>
+        <div id="idle-clock" aria-label="Current time">00:00:00</div>
+        <div id="idle-subtext">Waiting to start...</div>
+      </div>
+
+      <!-- Ended state -->
+      <div id="ended-content" aria-live="polite">
+        <div id="ended-label">Event Complete</div>
+        <div id="ended-elapsed" aria-label="Total elapsed time">00:00:00</div>
+        <div id="ended-variance"></div>
+      </div>
+
+      <!-- Running / paused state -->
+      <div id="running-content">
+        <div id="cue-title">Cue Title</div>
+        <div id="speaker-name"></div>
+        <div id="timer-region">
+          <div id="overtime-badge" aria-hidden="true">OVERTIME</div>
+          <div
+            id="timer-display"
+            role="timer"
+            aria-live="off"
+            aria-label="Time remaining"
+            aria-atomic="true"
+          >00:00</div>
+          <div id="progress-bar-wrap" role="progressbar" aria-label="Time remaining progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100">
+            <div id="progress-bar-fill"></div>
+          </div>
+        </div>
+      </div>
+
+    </main>
+
+    <!-- Zone 3: Bottom status bar -->
+    <footer id="status-bar" role="contentinfo">
+      <div class="status-section left">
+        <div class="status-label">Up Next</div>
+        <div id="up-next-title">-</div>
+        <div id="up-next-speaker"></div>
+      </div>
+      <div class="status-section center">
+        <div id="cue-progress-pill">-</div>
+      </div>
+      <div class="status-section right">
+        <div class="status-label" id="ends-at-label">Ends at</div>
+        <div id="ends-at">--:--</div>
+      </div>
+    </footer>
+
+  </div><!-- /#app -->
+
+  <!-- Fullscreen button -->
+  <button id="fullscreen-btn" title="Toggle fullscreen (F)">&#x26F6; Fullscreen</button>
+
+  <!-- Flash message overlay -->
+  <div id="flash-overlay" role="alertdialog" aria-modal="true" aria-labelledby="flash-message-text">
+    <button id="flash-close-btn" aria-label="Close message">&times;</button>
+    <div id="flash-message-text"></div>
+  </div>
+
+  <script type="module">
+    import {
+      loadState,
+      saveState,
+      getChannel,
+      fmtMMSS,
+      fmtHHMMSS,
+      nowHHMMSS,
+      computeSchedule,
+      fmtTime,
+      broadcast,
+      defaultState,
+    } from './state.js';
+
+    // ── State ───────────────────────────────────────────────────────
+
+    let state = Object.assign(defaultState(), loadState() || {});
+
+    // Local timer tick tracking
+    let localTickInterval = null;
+    let lastTickAt = null;      // performance.now() of last tick
+    let storageSyncCounter = 0; // counts 100ms ticks; sync storage every 10 (1 sec)
+
+    // ── DOM refs ────────────────────────────────────────────────────
+
+    const $ = id => document.getElementById(id);
+
+    const elEventTitle       = $('event-title-display');
+    const elLiveClock        = $('live-clock');
+    const elEventElapsed     = $('event-elapsed-display');
+    const elScheduleVariance = $('schedule-variance');
+
+    const elHero             = $('hero');
+    const elIdleContent      = $('idle-content');
+    const elEndedContent     = $('ended-content');
+    const elRunningContent   = $('running-content');
+
+    const elIdleEventTitle   = $('idle-event-title');
+    const elIdleClock        = $('idle-clock');
+    const elEndedElapsed     = $('ended-elapsed');
+    const elEndedVariance    = $('ended-variance');
+
+    const elCueTitle         = $('cue-title');
+    const elSpeakerName      = $('speaker-name');
+    const elOvertimeBadge    = $('overtime-badge');
+    const elTimerDisplay     = $('timer-display');
+    const elProgressFill     = $('progress-bar-fill');
+    const elProgressWrap     = $('progress-bar-wrap');
+
+    const elUpNextTitle      = $('up-next-title');
+    const elUpNextSpeaker    = $('up-next-speaker');
+    const elCueProgress      = $('cue-progress-pill');
+    const elEndsAt           = $('ends-at');
+
+    const elFullscreenBtn    = $('fullscreen-btn');
+    const elFlashOverlay     = $('flash-overlay');
+    const elFlashText        = $('flash-message-text');
+    const elFlashClose       = $('flash-close-btn');
+
+    // ── Render ──────────────────────────────────────────────────────
+
+    function render() {
+      const s = state;
+      const activeCue = s.cues[s.activeCueIndex] ?? null;
+      const playState = s.playState;
+
+      // Header
+      elEventTitle.textContent = s.eventTitle || 'CueTimer';
+      elEventElapsed.textContent = fmtHHMMSS(s.eventElapsed ?? 0);
+
+      // Schedule variance
+      renderVariance(s);
+
+      // Hero zones
+      const isIdle   = playState === 'idle' || (!activeCue && playState !== 'ended');
+      const isEnded  = playState === 'ended';
+      const isActive = !isIdle && !isEnded;
+
+      elIdleContent.classList.toggle('visible', isIdle);
+      elEndedContent.classList.toggle('visible', isEnded);
+      elRunningContent.classList.toggle('visible', isActive);
+
+      if (isIdle) {
+        elIdleEventTitle.textContent = s.eventTitle || 'CueTimer';
+        // idle clock updates via tick
+        elHero.className = 'state-idle';
+      } else if (isEnded) {
+        elEndedElapsed.textContent = fmtHHMMSS(s.eventElapsed ?? 0);
+        renderEndedVariance(s);
+        elHero.className = 'state-ended';
+      } else if (isActive && activeCue) {
+        renderActiveCue(s, activeCue);
+      }
+
+      // Bottom bar
+      renderStatusBar(s);
+
+      // Flash overlay
+      renderFlash(s);
+    }
+
+    function renderVariance(s) {
+      const { cues, activeCueIndex, eventElapsed, eventStartTime } = s;
+      if (!cues || cues.length === 0 || s.playState === 'idle') {
+        elScheduleVariance.textContent = 'On Time';
+        elScheduleVariance.className = 'on-time';
+        return;
+      }
+      // Planned elapsed = sum of adjusted durations of played + active portion
+      let planned = 0;
+      for (let i = 0; i <= activeCueIndex && i < cues.length; i++) {
+        planned += cues[i].adjustedDuration ?? cues[i].plannedDuration ?? 0;
+      }
+      const actual = eventElapsed ?? 0;
+      const diff = actual - planned; // positive = behind, negative = ahead
+      const absDiff = Math.abs(diff);
+      if (absDiff < 30) {
+        elScheduleVariance.textContent = 'On Time';
+        elScheduleVariance.className = 'on-time';
+      } else if (diff > 0) {
+        elScheduleVariance.textContent = 'Behind +' + fmtMMSS(absDiff);
+        elScheduleVariance.className = 'behind';
+      } else {
+        elScheduleVariance.textContent = 'Ahead ' + fmtMMSS(absDiff);
+        elScheduleVariance.className = 'ahead';
+      }
+    }
+
+    function renderActiveCue(s, cue) {
+      const remaining = s.timerRemaining ?? 0;
+      const total = cue.adjustedDuration ?? cue.plannedDuration ?? 0;
+      const warningYellow = cue.warningYellow ?? 120;
+      const warningRed    = cue.warningRed    ?? 30;
+
+      // Color state
+      let colorState;
+      if (remaining < 0) {
+        colorState = 'state-overtime';
+      } else if (remaining <= warningRed) {
+        colorState = 'state-critical';
+      } else if (remaining <= warningYellow) {
+        colorState = 'state-warning';
+      } else {
+        colorState = 'state-normal';
+      }
+
+      // Overtime pulse on hero
+      elHero.className = colorState === 'state-overtime' ? 'overtime-active' : '';
+
+      // OVERTIME badge
+      elOvertimeBadge.classList.toggle('visible', colorState === 'state-overtime');
+
+      // Cue info
+      elCueTitle.textContent = cue.title || 'Untitled Cue';
+      elSpeakerName.textContent = cue.speaker || '';
+
+      // Timer display
+      elTimerDisplay.textContent = fmtMMSS(remaining);
+      elTimerDisplay.className = colorState;
+      elTimerDisplay.setAttribute('aria-label', 'Time remaining: ' + fmtMMSS(remaining));
+
+      // Progress bar: ratio of remaining/total, clamped 0-100
+      let pct = total > 0 ? Math.max(0, Math.min(100, (remaining / total) * 100)) : 0;
+      elProgressFill.style.width = pct + '%';
+      elProgressFill.className = colorState;
+      elProgressWrap.setAttribute('aria-valuenow', Math.round(pct));
+    }
+
+    function renderStatusBar(s) {
+      const { cues, activeCueIndex, playState } = s;
+      const total = cues ? cues.length : 0;
+
+      // Cue progress
+      if (activeCueIndex >= 0 && total > 0) {
+        elCueProgress.textContent = 'Cue ' + (activeCueIndex + 1) + ' of ' + total;
+      } else {
+        elCueProgress.textContent = '-';
+      }
+
+      // Up next
+      const nextIdx = cues ? cues.findIndex((c, i) => i > activeCueIndex && !c.played) : -1;
+      if (nextIdx >= 0) {
+        elUpNextTitle.textContent = cues[nextIdx].title || 'Untitled';
+        elUpNextSpeaker.textContent = cues[nextIdx].speaker || '';
+      } else {
+        elUpNextTitle.textContent = playState === 'ended' ? 'None' : '-';
+        elUpNextSpeaker.textContent = '';
+      }
+
+      // Ends at: sum remaining adjusted durations from activeCue onward
+      if (cues && activeCueIndex >= 0) {
+        let remainingSecs = s.timerRemaining ?? 0;
+        for (let i = activeCueIndex + 1; i < cues.length; i++) {
+          if (!cues[i].played) {
+            remainingSecs += (cues[i].adjustedDuration ?? cues[i].plannedDuration ?? 0);
+          }
+        }
+        const endsMs = Date.now() + remainingSecs * 1000;
+        elEndsAt.textContent = fmtTime(endsMs);
+      } else {
+        elEndsAt.textContent = '--:--';
+      }
+    }
+
+    function renderEndedVariance(s) {
+      const { cues, eventElapsed } = s;
+      const totalPlanned = (cues || []).reduce((sum, c) => sum + (c.adjustedDuration ?? c.plannedDuration ?? 0), 0);
+      const diff = (eventElapsed ?? 0) - totalPlanned;
+      const abs = Math.abs(diff);
+      if (abs < 30) {
+        elEndedVariance.textContent = 'Finished on time';
+        elEndedVariance.style.color = 'var(--emerald)';
+      } else if (diff > 0) {
+        elEndedVariance.textContent = 'Ran over by ' + fmtMMSS(abs);
+        elEndedVariance.style.color = 'var(--amber)';
+      } else {
+        elEndedVariance.textContent = 'Finished ' + fmtMMSS(abs) + ' early';
+        elEndedVariance.style.color = 'var(--blue)';
+      }
+    }
+
+    function renderFlash(s) {
+      const hasMsg = s.flashMessage && s.flashMessage.trim() !== '';
+      elFlashOverlay.classList.toggle('visible', hasMsg);
+      if (hasMsg) {
+        elFlashText.textContent = s.flashMessage;
+        elFlashText.classList.toggle('blink', !!s.flashBlink);
+      } else {
+        elFlashText.textContent = '';
+        elFlashText.classList.remove('blink');
+      }
+    }
+
+    // ── Live clock (every second) ───────────────────────────────────
+
+    function tickClock() {
+      const timeStr = nowHHMMSS();
+      elLiveClock.textContent = timeStr;
+      elIdleClock.textContent = timeStr;
+    }
+
+    setInterval(tickClock, 1000);
+    tickClock();
+
+    // ── Local countdown when running ────────────────────────────────
+
+    function startLocalTick() {
+      if (localTickInterval) return;
+      lastTickAt = performance.now();
+      localTickInterval = setInterval(() => {
+        const now = performance.now();
+        const delta = (now - lastTickAt) / 1000; // seconds
+        lastTickAt = now;
+
+        if (state.playState === 'running') {
+          state.timerRemaining -= delta;
+          state.eventElapsed   += delta;
+
+          storageSyncCounter++;
+          if (storageSyncCounter >= 10) {
+            storageSyncCounter = 0;
+            saveState(state);
+          }
+        }
+
+        render();
+      }, 100);
+    }
+
+    function stopLocalTick() {
+      if (localTickInterval) {
+        clearInterval(localTickInterval);
+        localTickInterval = null;
+      }
+    }
+
+    function syncTickState(newState) {
+      const wasRunning = state.playState === 'running';
+      const isRunning  = newState.playState === 'running';
+
+      state = newState;
+
+      if (isRunning && !wasRunning) {
+        lastTickAt = performance.now();
+        startLocalTick();
+      } else if (!isRunning && wasRunning) {
+        stopLocalTick();
+        render();
+      } else if (!isRunning) {
+        render();
+      }
+      // If already running, the tick loop continues with updated state values
+    }
+
+    // ── BroadcastChannel sync ───────────────────────────────────────
+
+    const ch = getChannel();
+    if (ch) {
+      ch.onmessage = (evt) => {
+        if (evt.data?.type === 'STATE_UPDATE' && evt.data.state) {
+          syncTickState(evt.data.state);
+        }
+      };
+    }
+
+    // ── localStorage poll fallback (every 500ms) ────────────────────
+
+    setInterval(() => {
+      const freshState = loadState();
+      if (freshState) {
+        // Only apply if the data looks newer (timerRemaining changed, etc.)
+        // We use a simple heuristic: if playState changed or we are not currently running locally
+        if (freshState.playState !== state.playState ||
+            (!localTickInterval && state.playState !== 'running')) {
+          syncTickState(freshState);
+        } else if (freshState.flashMessage !== state.flashMessage) {
+          state.flashMessage = freshState.flashMessage;
+          state.flashBlink   = freshState.flashBlink;
+          renderFlash(state);
+        } else if (freshState.activeCueIndex !== state.activeCueIndex) {
+          syncTickState(freshState);
+        }
+      }
+    }, 500);
+
+    // ── Flash message close ─────────────────────────────────────────
+
+    elFlashClose.addEventListener('click', () => {
+      state.flashMessage = null;
+      state.flashBlink   = false;
+      broadcast(state);
+      renderFlash(state);
+    });
+
+    // ── Fullscreen ──────────────────────────────────────────────────
+
+    function toggleFullscreen() {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    }
+
+    function updateFullscreenBtn() {
+      if (document.fullscreenElement) {
+        elFullscreenBtn.textContent = 'Exit Fullscreen';
+      } else {
+        elFullscreenBtn.innerHTML = '&#x26F6; Fullscreen';
+      }
+    }
+
+    elFullscreenBtn.addEventListener('click', toggleFullscreen);
+    document.addEventListener('fullscreenchange', updateFullscreenBtn);
+
+    // ── Keyboard shortcuts ──────────────────────────────────────────
+
+    document.addEventListener('keydown', (evt) => {
+      // Don't fire if flash overlay is active and user presses something
+      if (evt.key === 'f' || evt.key === 'F') {
+        // Only if no input/button is focused
+        if (document.activeElement.tagName === 'BODY' ||
+            document.activeElement === document.documentElement) {
+          toggleFullscreen();
+        }
+      }
+      // Escape is handled natively by the browser for fullscreen exit
+    });
+
+    // ── Initial render ──────────────────────────────────────────────
+
+    const initialState = loadState();
+    if (initialState) {
+      state = initialState;
+    }
+
+    // Start local tick if we loaded into running state
+    if (state.playState === 'running') {
+      lastTickAt = performance.now();
+      startLocalTick();
+    } else {
+      render();
+    }
+  </script>
+</body>
+</html>
