@@ -24,6 +24,7 @@ export interface FlashMessage {
 }
 
 export interface AppState {
+  eventName?: string;
   eventStartTime: string; // e.g. "09:00"
   cues: Cue[];
   activeCueIndex: number;
@@ -36,6 +37,16 @@ export interface AppState {
   adjustStepSec: number;
   flashMessage: FlashMessage;
   googleSheetUrl: string;
+}
+
+export interface SavedRundown {
+  id: string;
+  name: string;
+  eventStartTime: string;
+  cues: Cue[];
+  totalDurationSec: number;
+  updatedAt: number;
+  source: 'manual' | 'import' | 'auto';
 }
 
 export interface ScheduledCueItem {

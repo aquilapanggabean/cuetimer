@@ -16,8 +16,9 @@ export function renderStageViewHtml(): string {
         <div class="stage-top-right">
           <div>
             <div class="stage-session-label">Event Elapsed</div>
-            <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:2px;">
-              <span id="stageScheduleStatusTag" class="tag mono">On Time</span>
+            <div class="stage-elapsed-row">
+              <span id="stageScheduleStatusTag" class="stage-variance-text mono">On Time</span>
+              <span class="meta-sep" aria-hidden="true">·</span>
               <span id="stageElapsedStopwatch" class="stage-clock-digits mono">00:00:00</span>
             </div>
           </div>
@@ -26,8 +27,8 @@ export function renderStageViewHtml(): string {
             <button type="button" id="btnToggleFullscreen" class="btn btn-sm" aria-label="Toggle Fullscreen">
               <span>Fullscreen</span>
             </button>
-            <button type="button" id="btnBackToController" class="btn btn-sm" aria-label="Back to Controller">
-              <span>Back to Controller</span>
+            <button type="button" id="btnBackToController" class="btn btn-sm" aria-label="Back to Operator Console">
+              <span>Back to Operator</span>
             </button>
           </div>
         </div>
@@ -35,10 +36,10 @@ export function renderStageViewHtml(): string {
 
       <!-- Zone 2: Center Hero Countdown -->
       <main class="stage-hero-zone" aria-live="polite">
-        <div style="display:flex;flex-direction:column;align-items:center;gap:6px;">
-          <div style="display:flex;align-items:center;gap:8px;">
-            <span id="stageOvertimeTag" class="tag tag-red hidden" style="font-size:13px;padding:4px 10px;">OVERTIME</span>
-            <span id="stagePausedTag" class="tag tag-amber hidden" style="font-size:13px;padding:4px 10px;">PAUSED</span>
+        <div class="stage-cue-header">
+          <div class="stage-state-row">
+            <span id="stageOvertimeTag" class="stage-state-badge is-overtime hidden">OVERTIME</span>
+            <span id="stagePausedTag" class="stage-state-badge is-paused hidden">PAUSED</span>
           </div>
           <h2 id="stageCueTitle" class="stage-cue-heading">Opening Remarks</h2>
           <div id="stageCueSpeaker" class="stage-cue-sub">Event Host</div>
@@ -70,15 +71,16 @@ export function renderStageViewHtml(): string {
       <!-- Zone 3: Bottom Status Bar -->
       <footer class="stage-bottom-zone">
         <div class="stage-upnext-row">
-          <span class="tag tag-neutral-bright">UP NEXT</span>
-          <span id="stageUpNextTitle" style="font-size:clamp(1rem, 1.9vw, 1.45rem);font-weight:600;">Keynote Address</span>
-          <span id="stageUpNextMeta" class="mono" style="font-size:clamp(0.9rem, 1.5vw, 1.15rem);color:var(--text-muted);">
-            Lead Speaker | 20:00
+          <span class="stage-upnext-label">Up Next</span>
+          <span class="meta-sep" aria-hidden="true">·</span>
+          <span id="stageUpNextTitle" class="stage-upnext-title">Keynote Address</span>
+          <span id="stageUpNextMeta" class="mono stage-upnext-meta">
+            Lead Speaker · 20:00
           </span>
         </div>
 
-        <div class="mono" style="font-size:12px;color:var(--text-muted);">
-          CueTimer Stage Feed
+        <div id="stageEventTitleFooter" class="mono stage-feed-footer">
+          CueTimer Stage Display
         </div>
       </footer>
     </div>

@@ -1,4 +1,4 @@
-import { AppState, Cue } from './core/types';
+import { AppState, Cue, SavedRundown } from './core/types';
 import {
   formatMMSS,
   formatHHMMSS,
@@ -10,11 +10,27 @@ import {
 } from './core/timeEngine';
 import { computeSchedule } from './core/scheduleEngine';
 import { applyRippleShift, applyTrimNext, applyBufferProportionalTrim } from './core/recoveryEngine';
+import { resolveShortcutAction } from './core/shortcuts';
 import { AudioEngine } from './audio/audioEngine';
 import { requestScreenWakeLock, releaseScreenWakeLock } from './core/wakeLock';
 import { HistoryManager } from './storage/historyManager';
-import { saveEventToDb } from './storage/indexedDb';
-import { parseSpreadsheet, exportRundownToExcel, createId } from './storage/spreadsheetParser';
+import {
+  saveEventToDb,
+  loadEventFromDb,
+  loadActiveEventSync,
+  saveLastUsedRundown,
+  loadLastUsedRundown,
+  loadLastUsedRundownSync,
+  saveNamedRundown,
+  listNamedRundowns,
+  deleteNamedRundown
+} from './storage/indexedDb';
+import {
+  parseSpreadsheetWithMeta,
+  exportRundownToExcel,
+  downloadRundownTemplate,
+  createId
+} from './storage/spreadsheetParser';
 import { SyncEngine } from './sync/syncEngine';
 import { getCurrentRoute, navigateTo, AppRoute } from './ui/router';
 import { renderOperatorViewHtml } from './ui/components/operatorView';
@@ -94,6 +110,7 @@ function buildDefaultCues(): Cue[] {
 
 function createInitialState(): AppState {
   return {
+    eventName: 'Main Stage Event',
     eventStartTime: '09:00',
     cues: buildDefaultCues(),
     activeCueIndex: 0,
@@ -114,19 +131,41 @@ function createInitialState(): AppState {
   };
 }
 
+function normalizeRestoredState(raw: Partial<AppState> | null): AppState {
+  const base = createInitialState();
+  if (!raw || !Array.isArray(raw.cues)) return base;
+  return {
+    ...base,
+    ...raw,
+    eventName: raw.eventName || base.eventName,
+    eventStartTime: raw.eventStartTime || base.eventStartTime,
+    cues: raw.cues,
+    activeCueIndex:
+      raw.cues.length > 0
+        ? Math.max(0, Math.min(raw.activeCueIndex ?? 0, raw.cues.length - 1))
+        : 0,
+    adjustStepSec: raw.adjustStepSec && raw.adjustStepSec > 0 ? raw.adjustStepSec : 60,
+    flashMessage: raw.flashMessage
+      ? { ...base.flashMessage, ...raw.flashMessage }
+      : base.flashMessage
+  };
+}
+
 // App Singleton Services
 const syncEngine = new SyncEngine('cuetimer_sync_production_v1');
 const audioEngine = new AudioEngine();
-const initialState = createInitialState();
+const initialState = normalizeRestoredState(loadActiveEventSync());
 const historyManager = new HistoryManager<AppState>(initialState, 30);
 let state: AppState = initialState;
 
 let currentRoute: AppRoute = 'operator';
 let pendingOvertimeAction: { overtimeSec: number; advanceAfter: boolean } | null = null;
 let draggedRowIndex: number | null = null;
+let searchFilterQuery = '';
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 let idleMouseTimer: ReturnType<typeof setTimeout> | null = null;
 let lastChimePlayedForCue: string | null = null;
+let cachedLastRundown: SavedRundown | null = loadLastUsedRundownSync();
 
 function showToast(text: string): void {
   const banner = document.getElementById('toastBanner');
@@ -140,12 +179,38 @@ function showToast(text: string): void {
   }, 3500);
 }
 
-function commitState(pushToHistory = true): void {
+function buildRundownSnapshot(nameOverride?: string, source: 'manual' | 'import' | 'auto' = 'auto'): SavedRundown {
+  const totalDurationSec = state.cues.reduce((sum, c) => sum + (c.plannedDurationSec || 0), 0);
+  const cleanCues: Cue[] = state.cues.map((c) => ({
+    ...c,
+    adjustedDurationSec: c.plannedDurationSec,
+    status: 'pending'
+  }));
+
+  return {
+    id: createId('rundown'),
+    name: (nameOverride || state.eventName || 'Untitled Rundown').trim(),
+    eventStartTime: state.eventStartTime || '09:00',
+    cues: cleanCues,
+    totalDurationSec,
+    updatedAt: Date.now(),
+    source
+  };
+}
+
+function commitState(pushToHistory = true, updateLastSnapshot = true): void {
   if (pushToHistory) {
     historyManager.push(JSON.parse(JSON.stringify(state)));
   }
   syncEngine.publishState(state);
   saveEventToDb('current_active_event', state).catch(() => {});
+
+  if (updateLastSnapshot && state.cues.length > 0) {
+    const snap = buildRundownSnapshot(state.eventName, 'auto');
+    cachedLastRundown = snap;
+    saveLastUsedRundown(snap).catch(() => {});
+  }
+
   updateUndoRedoButtons();
   renderFullUI();
 }
@@ -214,7 +279,7 @@ function startPlayback(): void {
   state.isRunning = true;
   state.startedAtEpoch = now;
   cue.status = 'active';
-  commitState();
+  commitState(true, false);
 }
 
 function pausePlayback(): void {
@@ -223,7 +288,7 @@ function pausePlayback(): void {
   state.accumulatedElapsedMs = getActiveElapsedMs(now);
   state.startedAtEpoch = null;
   state.isRunning = false;
-  commitState();
+  commitState(true, false);
 }
 
 function toggleStartPause(): void {
@@ -256,7 +321,7 @@ function activateCueAtIndex(targetIndex: number, preserveRunState?: boolean): vo
     state.isRunning = false;
     state.startedAtEpoch = null;
   }
-  commitState();
+  commitState(true, false);
 }
 
 function requestNextCue(): void {
@@ -280,7 +345,7 @@ function requestNextCue(): void {
     if (state.eventFirstStartedEpoch && !state.eventEndedEpoch) {
       state.eventEndedEpoch = now;
     }
-    commitState();
+    commitState(true, false);
     showToast('Completed final cue in rundown.');
   }
 }
@@ -302,7 +367,7 @@ function resetCurrentCue(): void {
   state.accumulatedElapsedMs = 0;
   lastChimePlayedForCue = null;
   cue.adjustedDurationSec = cue.plannedDurationSec;
-  commitState();
+  commitState(true, false);
   showToast('Cue reset to planned duration.');
 }
 
@@ -313,8 +378,17 @@ function endEventPlayback(): void {
   if (state.eventFirstStartedEpoch && !state.eventEndedEpoch) {
     state.eventEndedEpoch = now;
   }
-  commitState();
+  commitState(true, false);
   showToast('Event playback ended.');
+}
+
+function adjustActiveCueDuration(deltaSec: number): void {
+  const cue = getActiveCue();
+  if (!cue) return;
+  cue.adjustedDurationSec = Math.max(0, cue.adjustedDurationSec + deltaSec);
+  commitState(true, false);
+  const sign = deltaSec >= 0 ? '+' : '-';
+  showToast(`Adjusted active cue by ${sign}${formatMMSS(Math.abs(deltaSec))}.`);
 }
 
 function evaluateAutoNext(): void {
@@ -334,7 +408,7 @@ function evaluateAutoNext(): void {
       state.accumulatedElapsedMs = carryOverMs;
       state.startedAtEpoch = now;
       lastChimePlayedForCue = null;
-      commitState();
+      commitState(true, false);
     } else {
       cue.status = 'completed';
       state.isRunning = false;
@@ -343,7 +417,7 @@ function evaluateAutoNext(): void {
       if (state.eventFirstStartedEpoch && !state.eventEndedEpoch) {
         state.eventEndedEpoch = now;
       }
-      commitState();
+      commitState(true, false);
     }
   }
 }
@@ -389,6 +463,32 @@ function openOvertimeModal(overtimeSec?: number, advanceAfter?: boolean): void {
       : 'Schedule variance is behind by ' + formatMMSS(delta) + '. Choose recovery mode:';
   }
 
+  // Populate live previews on the 3 recovery cards
+  const baseMetrics = computeMetrics();
+  const rippleEnd = baseMetrics.plannedEndEpoch + (state.scheduleOffsetSec + delta) * 1000;
+  const trimRes = applyTrimNext(state.cues, state.activeCueIndex, delta);
+  const propRes = applyBufferProportionalTrim(state.cues, state.activeCueIndex, delta);
+
+  const rippleEl = document.getElementById('otPreviewRipple');
+  const trimEl = document.getElementById('otPreviewTrimNext');
+  const propEl = document.getElementById('otPreviewProportional');
+
+  if (rippleEl) {
+    rippleEl.textContent = `New Projected End: ${formatClockHHMM(rippleEnd)} (+${formatMMSS(delta)})`;
+  }
+  if (trimEl) {
+    const nextCue = state.cues[state.activeCueIndex + 1];
+    const nextAfter = trimRes.updatedCues[state.activeCueIndex + 1];
+    trimEl.textContent = nextCue && nextAfter
+      ? `${nextCue.title}: ${formatMMSS(nextCue.adjustedDurationSec)} -> ${formatMMSS(nextAfter.adjustedDurationSec)}`
+      : 'No subsequent cue available to trim';
+  }
+  if (propEl) {
+    propEl.textContent = propRes.leftoverOffsetSec > 0
+      ? `Absorbed ${formatMMSS(delta - propRes.leftoverOffsetSec)} · Remainder +${formatMMSS(propRes.leftoverOffsetSec)}`
+      : `Full ${formatMMSS(delta)} absorbed across upcoming buffers/cues`;
+  }
+
   if (skipBtn) {
     skipBtn.classList.toggle('hidden', !advanceAfter);
   }
@@ -400,6 +500,13 @@ function closeOvertimeModal(): void {
   const modalEl = document.getElementById('overtimeRecoveryModal');
   if (modalEl) modalEl.classList.add('hidden');
   pendingOvertimeAction = null;
+}
+
+function closeAllModals(): void {
+  closeOvertimeModal();
+  document.getElementById('saveRundownModal')?.classList.add('hidden');
+  document.getElementById('savedRundownsModal')?.classList.add('hidden');
+  document.getElementById('shortcutsModal')?.classList.add('hidden');
 }
 
 function executeRecovery(mode: 'ripple' | 'trim_next' | 'proportional'): void {
@@ -431,9 +538,121 @@ function executeRecovery(mode: 'ripple' | 'trim_next' | 'proportional'): void {
   }
 }
 
+// Saved Rundowns & Last Used Helpers
+function applyLoadedRundown(rundown: SavedRundown, labelPrefix = 'Loaded'): void {
+  const clonedCues: Cue[] = (rundown.cues || []).map((c) => ({
+    ...c,
+    id: c.id || createId('cue'),
+    adjustedDurationSec: c.plannedDurationSec,
+    status: 'pending'
+  }));
+
+  state.eventName = rundown.name || state.eventName;
+  state.eventStartTime = rundown.eventStartTime || state.eventStartTime || '09:00';
+  state.cues = clonedCues;
+  state.activeCueIndex = 0;
+  state.isRunning = false;
+  state.startedAtEpoch = null;
+  state.accumulatedElapsedMs = 0;
+  state.eventFirstStartedEpoch = null;
+  state.eventEndedEpoch = null;
+  state.scheduleOffsetSec = 0;
+  lastChimePlayedForCue = null;
+
+  commitState(true, true);
+  showToast(`${labelPrefix} "${rundown.name}" (${clonedCues.length} cues · Start ${state.eventStartTime}).`);
+}
+
+function openSaveRundownModal(): void {
+  if (!state.cues.length) {
+    showToast('Add at least one cue before saving.');
+    return;
+  }
+  const modal = document.getElementById('saveRundownModal');
+  const input = document.getElementById('saveRundownNameInput') as HTMLInputElement | null;
+  const summary = document.getElementById('saveRundownSummary');
+  if (input) {
+    input.value = state.eventName || 'Event Rundown';
+  }
+  if (summary) {
+    const totalSec = state.cues.reduce((sum, c) => sum + c.plannedDurationSec, 0);
+    summary.textContent = `${state.cues.length} cues · Start ${state.eventStartTime} · Total ${formatHHMMSS(totalSec)}`;
+  }
+  modal?.classList.remove('hidden');
+  setTimeout(() => {
+    input?.focus();
+    input?.select();
+  }, 20);
+}
+
+async function openSavedRundownsModal(): Promise<void> {
+  const modal = document.getElementById('savedRundownsModal');
+  modal?.classList.remove('hidden');
+  await renderSavedRundownsModalContent();
+}
+
+async function renderSavedRundownsModalContent(): Promise<void> {
+  const lastCard = document.getElementById('lastUsedRundownCard');
+  const lastName = document.getElementById('lastUsedRundownName');
+  const lastMeta = document.getElementById('lastUsedRundownMeta');
+  const listEl = document.getElementById('savedRundownsList');
+
+  const last = (await loadLastUsedRundown()) || cachedLastRundown;
+  if (last) {
+    cachedLastRundown = last;
+  }
+
+  if (lastCard && lastName && lastMeta) {
+    if (last && last.cues.length > 0) {
+      lastCard.classList.remove('hidden');
+      lastName.textContent = last.name || 'Last Used Rundown';
+      const savedDate = new Date(last.updatedAt).toLocaleString([], {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+      lastMeta.textContent = `${last.cues.length} cues · Start ${last.eventStartTime} · ${formatHHMMSS(last.totalDurationSec)} · ${savedDate}`;
+    } else {
+      lastCard.classList.add('hidden');
+    }
+  }
+
+  if (!listEl) return;
+  const items = await listNamedRundowns();
+
+  if (!items.length) {
+    listEl.innerHTML = `<div class="saved-empty-msg">No saved rundowns yet. Click "+ Save Current" to store your active rundown in the local library.</div>`;
+    return;
+  }
+
+  listEl.innerHTML = items
+    .map((item) => {
+      const dateStr = new Date(item.updatedAt).toLocaleString([], {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+      return `
+        <div class="saved-rundown-item" data-rundown-id="${escapeHtmlAttr(item.id)}">
+          <div class="saved-item-main">
+            <div class="saved-item-title">${escapeHtmlAttr(item.name)}</div>
+            <div class="mono saved-item-meta">${item.cues.length} cues · Start ${escapeHtmlAttr(item.eventStartTime)} · ${formatHHMMSS(item.totalDurationSec)} · ${escapeHtmlAttr(dateStr)}</div>
+          </div>
+          <div class="saved-item-actions">
+            <button type="button" class="btn btn-sm btn-contrast" data-saved-action="load" data-rundown-id="${escapeHtmlAttr(item.id)}" aria-label="Load ${escapeHtmlAttr(item.name)}">Load</button>
+            <button type="button" class="btn btn-sm btn-ghost" data-saved-action="delete" data-rundown-id="${escapeHtmlAttr(item.id)}" aria-label="Delete ${escapeHtmlAttr(item.name)}" style="color:#FCA5A5;">Delete</button>
+          </div>
+        </div>
+      `;
+    })
+    .join('');
+}
+
 // Rendering
 function escapeHtmlAttr(value: unknown): string {
-  return String(value || '')
+  return String(value ?? '')
     .replace(/&/g, '&amp;')
     .replace(/"/g, '&quot;')
     .replace(/</g, '&lt;')
@@ -450,6 +669,10 @@ function renderRundownRows(): void {
     emptyBox.classList.remove('hidden');
     tableWrap.classList.add('hidden');
     tbody.innerHTML = '';
+    const emptyLoadLast = document.getElementById('btnEmptyLoadLast');
+    if (emptyLoadLast) {
+      emptyLoadLast.classList.toggle('hidden', !cachedLastRundown || !cachedLastRundown.cues.length);
+    }
     return;
   }
 
@@ -458,60 +681,73 @@ function renderRundownRows(): void {
 
   const metrics = computeMetrics();
   const frag = document.createDocumentFragment();
+  const q = searchFilterQuery.trim().toLowerCase();
+
+  let renderedCount = 0;
 
   state.cues.forEach((cue, idx) => {
+    if (q) {
+      const hay = `${cue.title} ${cue.speaker} ${cue.notes}`.toLowerCase();
+      if (!hay.includes(q)) return;
+    }
+    renderedCount++;
+
     const tr = document.createElement('tr');
     tr.className = 'cue-row';
     if (idx === state.activeCueIndex) tr.classList.add('is-active');
     else if (cue.status === 'completed') tr.classList.add('is-completed');
-    tr.draggable = true;
+    tr.draggable = !q;
     tr.dataset.index = String(idx);
 
-    tr.addEventListener('dragstart', (e) => {
-      draggedRowIndex = idx;
-      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
-    });
-    tr.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      tr.classList.add('is-drag-target');
-    });
-    tr.addEventListener('dragleave', () => {
-      tr.classList.remove('is-drag-target');
-    });
-    tr.addEventListener('drop', (e) => {
-      e.preventDefault();
-      tr.classList.remove('is-drag-target');
-      if (draggedRowIndex !== null && draggedRowIndex !== idx) {
-        const moved = state.cues.splice(draggedRowIndex, 1)[0];
-        state.cues.splice(idx, 0, moved);
-        commitState();
-      }
-      draggedRowIndex = null;
-    });
+    if (!q) {
+      tr.addEventListener('dragstart', (e) => {
+        draggedRowIndex = idx;
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+      });
+      tr.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        tr.classList.add('is-drag-target');
+      });
+      tr.addEventListener('dragleave', () => {
+        tr.classList.remove('is-drag-target');
+      });
+      tr.addEventListener('drop', (e) => {
+        e.preventDefault();
+        tr.classList.remove('is-drag-target');
+        if (draggedRowIndex !== null && draggedRowIndex !== idx) {
+          const moved = state.cues.splice(draggedRowIndex, 1)[0];
+          state.cues.splice(idx, 0, moved);
+          commitState();
+        }
+        draggedRowIndex = null;
+      });
+    }
 
     const sched = metrics.cueSchedules[idx];
-    const rangeLabel = sched ? formatClockHHMM(sched.startEpoch) + ' - ' + formatClockHHMM(sched.endEpoch) : '--:--';
+    const rangeLabel = sched ? formatClockHHMM(sched.startEpoch) + ' – ' + formatClockHHMM(sched.endEpoch) : '--:--';
     const diffSec = cue.adjustedDurationSec - cue.plannedDurationSec;
     const diffTag =
       diffSec !== 0
-        ? ` <span class="tag ${diffSec > 0 ? 'tag-amber' : 'tag-neutral-bright'} mono" style="padding:1px 4px;font-size:10px;">${diffSec > 0 ? '+' : ''}${formatMMSS(diffSec)}</span>`
+        ? `<span class="cue-delta-text mono ${diffSec > 0 ? 'is-plus' : 'is-minus'}">${diffSec > 0 ? '+' : ''}${formatMMSS(diffSec)}</span>`
         : '';
+
+    const safeTitle = escapeHtmlAttr(cue.title);
 
     tr.innerHTML = `
       <td>
-        <div style="display:flex;align-items:center;gap:4px;">
-          <span class="drag-grip" title="Drag to reorder">&#x22EE;&#x22EE;</span>
-          <span class="mono" style="font-weight:500;min-width:18px;">${idx + 1}</span>
+        <div class="cue-index-cell">
+          <span class="drag-grip" title="${q ? 'Clear filter to reorder' : 'Drag to reorder'}">&#x22EE;&#x22EE;</span>
+          <span class="cue-index-num mono">${idx + 1}</span>
         </div>
       </td>
       <td>
-        <input type="text" class="inline-cell-input" data-field="title" data-index="${idx}" value="${escapeHtmlAttr(cue.title)}" aria-label="Cue Title" />
+        <input type="text" class="inline-cell-input" data-field="title" data-index="${idx}" value="${safeTitle}" aria-label="Cue ${idx + 1} title" />
       </td>
       <td>
-        <input type="text" class="inline-cell-input" data-field="speaker" data-index="${idx}" value="${escapeHtmlAttr(cue.speaker)}" aria-label="Speaker" />
+        <input type="text" class="inline-cell-input" data-field="speaker" data-index="${idx}" value="${escapeHtmlAttr(cue.speaker)}" aria-label="Cue ${idx + 1} speaker" />
       </td>
       <td>
-        <input type="text" class="inline-cell-input inline-mono" data-field="planned" data-index="${idx}" value="${formatMMSS(cue.plannedDurationSec)}" aria-label="Planned Duration" />
+        <input type="text" class="inline-cell-input inline-mono" data-field="planned" data-index="${idx}" value="${formatMMSS(cue.plannedDurationSec)}" aria-label="Cue ${idx + 1} planned duration" />
       </td>
       <td class="mono" style="white-space:nowrap;font-size:12px;">
         <span>${formatMMSS(cue.adjustedDurationSec)}</span>${diffTag}
@@ -520,35 +756,44 @@ function renderRundownRows(): void {
         ${rangeLabel}
       </td>
       <td>
-        <select class="select select-sm" data-field="type" data-index="${idx}">
+        <select class="select select-sm" data-field="type" data-index="${idx}" aria-label="Cue ${idx + 1} type">
           <option value="Main" ${cue.type === 'Main' ? 'selected' : ''}>Main</option>
           <option value="Buffer/Break" ${cue.type === 'Buffer/Break' ? 'selected' : ''}>Buffer/Break</option>
         </select>
       </td>
       <td>
-        <select class="select select-sm" data-field="mode" data-index="${idx}">
+        <select class="select select-sm" data-field="mode" data-index="${idx}" aria-label="Cue ${idx + 1} trigger mode">
           <option value="manual" ${cue.mode === 'manual' ? 'selected' : ''}>Manual</option>
           <option value="auto" ${cue.mode === 'auto' ? 'selected' : ''}>Auto-next</option>
         </select>
       </td>
       <td>
-        <div style="display:flex;align-items:center;gap:4px;">
-          <input type="text" class="inline-cell-input inline-mono" style="width:54px;color:var(--alert-amber);" data-field="yellow" data-index="${idx}" value="${formatMMSS(cue.yellowThresholdSec)}" title="Yellow warning" />
-          <input type="text" class="inline-cell-input inline-mono" style="width:54px;color:var(--alert-red);" data-field="red" data-index="${idx}" value="${formatMMSS(cue.redThresholdSec)}" title="Red warning" />
+        <div class="warn-inputs-pair">
+          <input type="text" class="inline-cell-input inline-mono" style="width:48px;color:var(--alert-amber);" data-field="yellow" data-index="${idx}" value="${formatMMSS(cue.yellowThresholdSec)}" title="Yellow warning threshold" aria-label="Cue ${idx + 1} yellow warning" />
+          <input type="text" class="inline-cell-input inline-mono" style="width:48px;color:var(--alert-red);" data-field="red" data-index="${idx}" value="${formatMMSS(cue.redThresholdSec)}" title="Red warning threshold" aria-label="Cue ${idx + 1} red warning" />
         </div>
       </td>
       <td>
-        <input type="text" class="inline-cell-input" data-field="notes" data-index="${idx}" value="${escapeHtmlAttr(cue.notes)}" placeholder="Notes" />
+        <input type="text" class="inline-cell-input" data-field="notes" data-index="${idx}" value="${escapeHtmlAttr(cue.notes)}" placeholder="Notes" aria-label="Cue ${idx + 1} notes" />
       </td>
       <td style="text-align:right;white-space:nowrap;">
-        <button type="button" class="btn btn-icon btn-ghost" data-row-action="play" data-index="${idx}" title="Play Now">&#x25B6;</button>
-        <button type="button" class="btn btn-icon btn-ghost" data-row-action="duplicate" data-index="${idx}" title="Duplicate">&#x2398;</button>
-        <button type="button" class="btn btn-icon btn-ghost" data-row-action="delete" data-index="${idx}" title="Delete" style="color:#FCA5A5;">&times;</button>
+        <div class="row-actions-group">
+          <button type="button" class="btn btn-icon btn-ghost" data-row-action="play" data-index="${idx}" title="Play ${safeTitle}" aria-label="Play ${safeTitle}">&#x25B6;</button>
+          <button type="button" class="btn btn-icon btn-ghost" data-row-action="up" data-index="${idx}" title="Move up" aria-label="Move ${safeTitle} up" ${idx === 0 || q ? 'disabled' : ''}>&#x2191;</button>
+          <button type="button" class="btn btn-icon btn-ghost" data-row-action="duplicate" data-index="${idx}" title="Duplicate ${safeTitle}" aria-label="Duplicate ${safeTitle}">&#x2398;</button>
+          <button type="button" class="btn btn-icon btn-ghost" data-row-action="delete" data-index="${idx}" title="Delete ${safeTitle}" aria-label="Delete ${safeTitle}" style="color:#FCA5A5;">&times;</button>
+        </div>
       </td>
     `;
 
     frag.appendChild(tr);
   });
+
+  if (renderedCount === 0 && q) {
+    const emptyFilterRow = document.createElement('tr');
+    emptyFilterRow.innerHTML = `<td colspan="11" style="text-align:center;padding:24px;color:var(--text-muted);">No cues matching "${escapeHtmlAttr(searchFilterQuery)}".</td>`;
+    frag.appendChild(emptyFilterRow);
+  }
 
   tbody.innerHTML = '';
   tbody.appendChild(frag);
@@ -557,6 +802,7 @@ function renderRundownRows(): void {
 function renderLiveTick(): void {
   const now = Date.now();
   const cue = getActiveCue();
+  const nextCue = state.cues[state.activeCueIndex + 1] || null;
   const remMs = getActiveRemainingMs(now);
   const remSec = remMs < 0 ? -Math.ceil(Math.abs(remMs) / 1000) : Math.ceil(remMs / 1000);
   const formattedCountdown = cue ? formatMMSS(remSec) : '00:00';
@@ -572,8 +818,18 @@ function renderLiveTick(): void {
       ? 'warning'
       : 'normal';
 
-  const textClass = alertLevel === 'overtime' || alertLevel === 'critical' ? 'text-critical' : alertLevel === 'warning' ? 'text-warning' : 'text-normal';
-  const fillClass = alertLevel === 'overtime' || alertLevel === 'critical' ? 'fill-critical' : alertLevel === 'warning' ? 'fill-warning' : 'fill-normal';
+  const textClass =
+    alertLevel === 'overtime' || alertLevel === 'critical'
+      ? 'text-critical'
+      : alertLevel === 'warning'
+      ? 'text-warning'
+      : 'text-normal';
+  const fillClass =
+    alertLevel === 'overtime' || alertLevel === 'critical'
+      ? 'fill-critical'
+      : alertLevel === 'warning'
+      ? 'fill-warning'
+      : 'fill-normal';
 
   const progressPct =
     cue && cue.adjustedDurationSec > 0
@@ -585,13 +841,13 @@ function renderLiveTick(): void {
   const metrics = computeMetrics(now);
 
   let varianceLabel = 'On Time';
-  let varianceClass = 'tag-neutral-bright';
+  let varianceStateClass = 'is-ontime';
   if (metrics.varianceSec >= 2) {
     varianceLabel = 'Behind +' + formatMMSS(metrics.varianceSec);
-    varianceClass = 'tag-red';
+    varianceStateClass = 'is-behind';
   } else if (metrics.varianceSec <= -2) {
     varianceLabel = 'Ahead -' + formatMMSS(Math.abs(metrics.varianceSec));
-    varianceClass = 'tag-neutral-bright';
+    varianceStateClass = 'is-ahead';
   }
 
   // Operator UI updates
@@ -605,7 +861,7 @@ function renderLiveTick(): void {
   if (projEndEl) projEndEl.textContent = formatClockHHMM(metrics.projectedEndEpoch);
   if (varBadge) {
     varBadge.textContent = varianceLabel;
-    varBadge.className = 'tag ' + varianceClass + ' mono';
+    varBadge.className = 'variance-status ' + varianceStateClass;
   }
 
   if (otBar) {
@@ -614,7 +870,10 @@ function renderLiveTick(): void {
       otBar.classList.remove('hidden');
       const textEl = document.getElementById('overtimeBarText');
       if (textEl) {
-        textEl.textContent = remSec < 0 ? 'Active cue is in overtime by +' + formatMMSS(otDelta) : 'Schedule is behind by +' + formatMMSS(otDelta);
+        textEl.textContent =
+          remSec < 0
+            ? 'Active cue is in overtime by +' + formatMMSS(otDelta)
+            : 'Schedule is behind by +' + formatMMSS(otDelta);
       }
     } else {
       otBar.classList.add('hidden');
@@ -630,13 +889,19 @@ function renderLiveTick(): void {
   const miniScreen = document.getElementById('miniStageScreen');
   if (miniScreen) {
     miniScreen.classList.toggle('is-overtime', alertLevel === 'overtime');
+    const miniSession = document.getElementById('miniSessionName');
     const miniClock = document.getElementById('miniClockText');
     const miniElapsed = document.getElementById('miniElapsedText');
     const miniCueTitle = document.getElementById('miniCueTitle');
     const miniCueSpeaker = document.getElementById('miniCueSpeaker');
     const miniHero = document.getElementById('miniHeroTimer');
     const miniFill = document.getElementById('miniProgressFill');
+    const miniUpNext = document.getElementById('miniUpNextText');
+    const miniStatus = document.getElementById('miniStatusTag');
 
+    if (miniSession) {
+      miniSession.textContent = state.cues.length ? `Cue ${state.activeCueIndex + 1} of ${state.cues.length}` : 'No Cues';
+    }
     if (miniClock) miniClock.textContent = clockStr;
     if (miniElapsed) miniElapsed.textContent = elapsedStr;
     if (miniCueTitle) miniCueTitle.textContent = cue ? cue.title : 'Standby';
@@ -649,21 +914,48 @@ function renderLiveTick(): void {
       miniFill.style.width = progressPct + '%';
       miniFill.className = 'mini-progress-fill ' + fillClass;
     }
+    if (miniUpNext) {
+      miniUpNext.textContent = nextCue ? `Up Next: ${nextCue.title}` : 'Up Next: End of Event';
+    }
+    if (miniStatus) {
+      miniStatus.textContent = alertLevel === 'overtime' ? 'OVERTIME' : state.isRunning ? 'LIVE' : state.accumulatedElapsedMs > 0 ? 'PAUSED' : 'STANDBY';
+    }
   }
 
   // Stage View (#/stage)
   const stageShell = document.getElementById('stageView');
   if (stageShell) {
     stageShell.classList.toggle('is-overtime', alertLevel === 'overtime');
+    const stageSession = document.getElementById('stageSessionIndicator');
     const stageClock = document.getElementById('stageLocalClock');
     const stageElapsed = document.getElementById('stageElapsedStopwatch');
+    const stageStatusTag = document.getElementById('stageScheduleStatusTag');
+    const stageOvertimeTag = document.getElementById('stageOvertimeTag');
+    const stagePausedTag = document.getElementById('stagePausedTag');
     const stageTitle = document.getElementById('stageCueTitle');
     const stageSpeaker = document.getElementById('stageCueSpeaker');
     const stageCountdown = document.getElementById('stageHeroCountdown');
     const stageFill = document.getElementById('stageProgressFill');
+    const stageBar = document.getElementById('stageProgressBar');
+    const stageUpNextTitle = document.getElementById('stageUpNextTitle');
+    const stageUpNextMeta = document.getElementById('stageUpNextMeta');
+    const stageFooter = document.getElementById('stageEventTitleFooter');
 
+    if (stageSession) {
+      stageSession.textContent = state.cues.length
+        ? `${state.eventName || 'Event'} · Cue ${state.activeCueIndex + 1} of ${state.cues.length}`
+        : 'Standby';
+    }
     if (stageClock) stageClock.textContent = clockStr;
     if (stageElapsed) stageElapsed.textContent = elapsedStr;
+    if (stageStatusTag) {
+      stageStatusTag.textContent = varianceLabel;
+      stageStatusTag.className = 'stage-variance-text mono ' + varianceStateClass;
+    }
+    if (stageOvertimeTag) stageOvertimeTag.classList.toggle('hidden', alertLevel !== 'overtime');
+    if (stagePausedTag) {
+      stagePausedTag.classList.toggle('hidden', state.isRunning || state.accumulatedElapsedMs === 0);
+    }
     if (stageTitle) stageTitle.textContent = cue ? cue.title : 'End of Rundown';
     if (stageSpeaker) stageSpeaker.textContent = cue ? cue.speaker : 'Standby';
     if (stageCountdown) {
@@ -673,6 +965,20 @@ function renderLiveTick(): void {
     if (stageFill) {
       stageFill.style.width = progressPct + '%';
       stageFill.className = 'stage-progress-bar-fill ' + fillClass;
+    }
+    if (stageBar) {
+      stageBar.setAttribute('aria-valuenow', String(Math.round(progressPct)));
+    }
+    if (stageUpNextTitle) {
+      stageUpNextTitle.textContent = nextCue ? nextCue.title : 'End of Rundown';
+    }
+    if (stageUpNextMeta) {
+      stageUpNextMeta.textContent = nextCue
+        ? `· ${nextCue.speaker} · ${formatMMSS(nextCue.adjustedDurationSec)}`
+        : '· Final Session';
+    }
+    if (stageFooter) {
+      stageFooter.textContent = `${state.eventName || 'CueTimer'} · Stage Display`;
     }
   }
 
@@ -685,20 +991,27 @@ function renderLiveTick(): void {
 
   if (overlayTimer) {
     overlayTimer.textContent = formattedCountdown;
-    overlayTimer.className = 'mono ' + textClass;
+    overlayTimer.className = 'mono overlay-timer-digits ' + textClass;
   }
   if (overlayBox) {
     overlayBox.classList.toggle('is-overtime', alertLevel === 'overtime');
   }
-  if (overlayCueTitle && cue) overlayCueTitle.textContent = cue.title;
-  if (overlayCueSpeaker && cue) overlayCueSpeaker.textContent = cue.speaker;
+  if (overlayCueTitle) overlayCueTitle.textContent = cue ? cue.title : 'Standby';
+  if (overlayCueSpeaker) overlayCueSpeaker.textContent = cue ? cue.speaker : '';
   if (overlayBadge) {
-    overlayBadge.textContent = alertLevel === 'overtime' ? 'OVERTIME' : state.isRunning ? 'LIVE' : 'PAUSED';
-    overlayBadge.className = 'tag ' + (alertLevel === 'overtime' ? 'tag-red' : 'tag-neutral-bright') + ' mono';
+    const isOvertime = alertLevel === 'overtime';
+    overlayBadge.textContent = isOvertime ? 'OVERTIME' : state.isRunning ? 'LIVE' : 'PAUSED';
+    overlayBadge.className =
+      'overlay-status-text mono ' + (isOvertime ? 'is-overtime' : !state.isRunning ? 'is-paused' : '');
   }
 }
 
 function renderFullUI(): void {
+  const eventNameInput = document.getElementById('eventNameInput') as HTMLInputElement | null;
+  if (eventNameInput && document.activeElement !== eventNameInput) {
+    eventNameInput.value = state.eventName || 'Main Stage Event';
+  }
+
   const startInput = document.getElementById('eventStartInput') as HTMLInputElement | null;
   if (startInput && document.activeElement !== startInput) {
     startInput.value = state.eventStartTime || '09:00';
@@ -707,8 +1020,14 @@ function renderFullUI(): void {
   const metaText = document.getElementById('rundownMetaText');
   if (metaText) {
     const totalSec = state.cues.reduce((sum, c) => sum + c.adjustedDurationSec, 0);
-    metaText.textContent = `${state.cues.length} cues | Total ${formatHHMMSS(totalSec)}`;
+    metaText.textContent = `${state.cues.length} cues · Total ${formatHHMMSS(totalSec)}`;
   }
+
+  const activeCue = getActiveCue();
+  const activeTitleEl = document.getElementById('transportActiveCueTitle');
+  const activeSpeakerEl = document.getElementById('transportActiveCueSpeaker');
+  if (activeTitleEl) activeTitleEl.textContent = activeCue ? activeCue.title : 'No active cue';
+  if (activeSpeakerEl) activeSpeakerEl.textContent = activeCue ? activeCue.speaker : 'Add a cue to begin';
 
   const btnStartPause = document.getElementById('btnStartPause');
   const labelStartPause = document.getElementById('labelStartPause');
@@ -725,6 +1044,31 @@ function renderFullUI(): void {
   const counterEl = document.getElementById('transportCueCounter');
   if (counterEl) {
     counterEl.textContent = state.cues.length ? `Cue ${state.activeCueIndex + 1} of ${state.cues.length}` : 'Cue 0 of 0';
+  }
+
+  // Sync preset adjust chips and custom inputs
+  document.querySelectorAll('.chip-btn[data-step]').forEach((chip) => {
+    const step = parseInt((chip as HTMLElement).dataset.step || '0', 10);
+    chip.classList.toggle('is-active', step === state.adjustStepSec);
+  });
+
+  const minInput = document.getElementById('adjustMinInput') as HTMLInputElement | null;
+  const secInput = document.getElementById('adjustSecInput') as HTMLInputElement | null;
+  if (minInput && document.activeElement !== minInput) {
+    minInput.value = String(Math.floor(state.adjustStepSec / 60));
+  }
+  if (secInput && document.activeElement !== secInput) {
+    secInput.value = String(state.adjustStepSec % 60);
+  }
+
+  // Load Last button state
+  const btnLoadLast = document.getElementById('btnLoadLastRundown') as HTMLButtonElement | null;
+  if (btnLoadLast) {
+    const hasLast = Boolean(cachedLastRundown && cachedLastRundown.cues.length > 0);
+    btnLoadLast.disabled = !hasLast;
+    btnLoadLast.title = hasLast
+      ? `Load last rundown: "${cachedLastRundown!.name}" (${cachedLastRundown!.cues.length} cues)`
+      : 'No recent rundown saved yet';
   }
 
   // Flash message banners
@@ -762,14 +1106,21 @@ function renderFullUI(): void {
   renderLiveTick();
 }
 
-function setupEventHandlers(): void {
-  // App routing button clicks
-  document.getElementById('btnLaunchStage')?.addEventListener('click', () => {
-    window.open(window.location.origin + window.location.pathname + '#/stage', 'CueTimerStage', 'width=1280,height=720');
+function setupRouteEventHandlers(): void {
+  // Workspace mode switcher
+  document.getElementById('navModeOperator')?.addEventListener('click', () => {
+    navigateTo('operator');
+    renderAppForRoute();
   });
 
-  document.getElementById('btnOpenOverlay')?.addEventListener('click', () => {
-    window.open(window.location.origin + window.location.pathname + '#/overlay', 'CueTimerOverlay', 'width=800,height=240');
+  document.getElementById('navModeStage')?.addEventListener('click', () => {
+    navigateTo('stage');
+    renderAppForRoute();
+  });
+
+  document.getElementById('navModeOverlay')?.addEventListener('click', () => {
+    navigateTo('overlay');
+    renderAppForRoute();
   });
 
   document.getElementById('btnInlineStagePreview')?.addEventListener('click', () => {
@@ -802,7 +1153,29 @@ function setupEventHandlers(): void {
       }
     };
     stageViewEl.addEventListener('mousemove', resetIdleTimer);
-    document.addEventListener('fullscreenchange', resetIdleTimer);
+  }
+
+  // Event Name & Event Start Time
+  const eventNameInput = document.getElementById('eventNameInput') as HTMLInputElement | null;
+  eventNameInput?.addEventListener('change', () => {
+    state.eventName = eventNameInput.value.trim() || 'Main Stage Event';
+    commitState();
+  });
+
+  const eventStartInput = document.getElementById('eventStartInput') as HTMLInputElement | null;
+  if (eventStartInput) {
+    const applyStartTime = (pushHistory: boolean) => {
+      const val = eventStartInput.value.trim();
+      if (/^\d{2}:\d{2}$/.test(val)) {
+        state.eventStartTime = val;
+        commitState(pushHistory);
+      }
+    };
+    eventStartInput.addEventListener('input', () => applyStartTime(false));
+    eventStartInput.addEventListener('change', () => {
+      applyStartTime(true);
+      showToast(`Event start time updated to ${state.eventStartTime}.`);
+    });
   }
 
   // Sound mute toggle
@@ -868,24 +1241,49 @@ function setupEventHandlers(): void {
     cue.adjustedDurationSec = Math.max(0, elapsedSec + newRemSec);
     inlineForm.classList.add('hidden');
     timerBtn?.classList.remove('hidden');
-    commitState();
+    commitState(true, false);
     showToast(`Active remaining set to ${formatMMSS(newRemSec)}.`);
   });
 
-  // Plus / Minus adjustments
+  // Preset duration chips & custom adjust step
+  document.querySelectorAll('.chip-btn[data-step]').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      const step = parseInt((chip as HTMLElement).dataset.step || '60', 10);
+      if (step > 0) {
+        state.adjustStepSec = step;
+        commitState(false, false);
+      }
+    });
+  });
+
+  const minInput = document.getElementById('adjustMinInput') as HTMLInputElement | null;
+  const secInput = document.getElementById('adjustSecInput') as HTMLInputElement | null;
+  const syncCustomStep = () => {
+    const mins = Math.max(0, parseInt(minInput?.value || '0', 10) || 0);
+    const secs = Math.max(0, Math.min(59, parseInt(secInput?.value || '0', 10) || 0));
+    state.adjustStepSec = Math.max(1, mins * 60 + secs);
+    commitState(false, false);
+  };
+  minInput?.addEventListener('change', syncCustomStep);
+  secInput?.addEventListener('change', syncCustomStep);
+
   document.getElementById('btnAdjustMinus')?.addEventListener('click', () => {
-    const cue = getActiveCue();
-    if (!cue) return;
-    cue.adjustedDurationSec = Math.max(0, cue.adjustedDurationSec - state.adjustStepSec);
-    commitState();
+    adjustActiveCueDuration(-state.adjustStepSec);
   });
 
   document.getElementById('btnAdjustPlus')?.addEventListener('click', () => {
-    const cue = getActiveCue();
-    if (!cue) return;
-    cue.adjustedDurationSec += state.adjustStepSec;
-    commitState();
+    adjustActiveCueDuration(state.adjustStepSec);
   });
+
+  // Search filter
+  const searchInput = document.getElementById('rundownSearchInput') as HTMLInputElement | null;
+  if (searchInput) {
+    searchInput.value = searchFilterQuery;
+    searchInput.addEventListener('input', () => {
+      searchFilterQuery = searchInput.value;
+      renderRundownRows();
+    });
+  }
 
   // Rundown table actions & inline edit
   const tbody = document.getElementById('rundownTableBody');
@@ -903,8 +1301,8 @@ function setupEventHandlers(): void {
       const delta = nextSec - cue.plannedDurationSec;
       cue.plannedDurationSec = nextSec;
       cue.adjustedDurationSec = Math.max(0, cue.adjustedDurationSec + delta);
-    } else if (field === 'type') cue.type = target.value as any;
-    else if (field === 'mode') cue.mode = target.value as any;
+    } else if (field === 'type') cue.type = target.value as Cue['type'];
+    else if (field === 'mode') cue.mode = target.value as Cue['mode'];
     else if (field === 'yellow') cue.yellowThresholdSec = parseDurationSeconds(target.value, cue.yellowThresholdSec);
     else if (field === 'red') cue.redThresholdSec = parseDurationSeconds(target.value, cue.redThresholdSec);
     else if (field === 'notes') cue.notes = target.value;
@@ -921,6 +1319,12 @@ function setupEventHandlers(): void {
 
     if (action === 'play') {
       activateCueAtIndex(idx, true);
+    } else if (action === 'up' && idx > 0) {
+      const moved = state.cues.splice(idx, 1)[0];
+      state.cues.splice(idx - 1, 0, moved);
+      if (state.activeCueIndex === idx) state.activeCueIndex = idx - 1;
+      else if (state.activeCueIndex === idx - 1) state.activeCueIndex = idx;
+      commitState();
     } else if (action === 'duplicate') {
       const source = state.cues[idx];
       state.cues.splice(idx + 1, 0, { ...source, id: createId('cue'), title: source.title + ' (Copy)' });
@@ -947,6 +1351,78 @@ function setupEventHandlers(): void {
     }
   });
 
+  // Save & Saved Rundowns Modals
+  document.getElementById('btnSaveRundownModal')?.addEventListener('click', openSaveRundownModal);
+  document.getElementById('btnOpenSavedModal')?.addEventListener('click', () => {
+    openSavedRundownsModal().catch(() => {});
+  });
+  document.getElementById('btnTriggerSaveFromLibrary')?.addEventListener('click', () => {
+    document.getElementById('savedRundownsModal')?.classList.add('hidden');
+    openSaveRundownModal();
+  });
+
+  document.getElementById('saveRundownForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const input = document.getElementById('saveRundownNameInput') as HTMLInputElement | null;
+    const name = (input?.value || '').trim();
+    if (!name) return;
+
+    state.eventName = name;
+    const snapshot = buildRundownSnapshot(name, 'manual');
+    cachedLastRundown = snapshot;
+    await saveNamedRundown(snapshot);
+    await saveLastUsedRundown(snapshot);
+    document.getElementById('saveRundownModal')?.classList.add('hidden');
+    commitState(false, false);
+    showToast(`Saved "${name}" to Saved Rundowns.`);
+  });
+
+  const loadLastHandler = async () => {
+    const last = (await loadLastUsedRundown()) || cachedLastRundown;
+    if (!last || !last.cues.length) {
+      showToast('No previous rundown available to load.');
+      return;
+    }
+    document.getElementById('savedRundownsModal')?.classList.add('hidden');
+    applyLoadedRundown(last, 'Loaded last rundown');
+  };
+
+  document.getElementById('btnLoadLastRundown')?.addEventListener('click', () => {
+    loadLastHandler().catch(() => {});
+  });
+  document.getElementById('btnEmptyLoadLast')?.addEventListener('click', () => {
+    loadLastHandler().catch(() => {});
+  });
+  document.getElementById('btnModalLoadLastRundown')?.addEventListener('click', () => {
+    loadLastHandler().catch(() => {});
+  });
+
+  document.getElementById('savedRundownsList')?.addEventListener('click', async (e) => {
+    const btn = (e.target as HTMLElement).closest('button[data-saved-action]') as HTMLElement | null;
+    if (!btn) return;
+    const action = btn.dataset.savedAction;
+    const id = btn.dataset.rundownId;
+    if (!id) return;
+
+    if (action === 'load') {
+      const items = await listNamedRundowns();
+      const target = items.find((r) => r.id === id);
+      if (target) {
+        document.getElementById('savedRundownsModal')?.classList.add('hidden');
+        applyLoadedRundown(target, 'Loaded');
+      }
+    } else if (action === 'delete') {
+      await deleteNamedRundown(id);
+      await renderSavedRundownsModalContent();
+      showToast('Removed saved rundown.');
+    }
+  });
+
+  // Keyboard Shortcuts modal button
+  document.getElementById('btnOpenShortcutsModal')?.addEventListener('click', () => {
+    document.getElementById('shortcutsModal')?.classList.remove('hidden');
+  });
+
   // Modal dismiss buttons
   document.querySelectorAll('[data-close-modal]').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -955,33 +1431,66 @@ function setupEventHandlers(): void {
     });
   });
 
-  // Spreadsheet import & export
+  document.querySelectorAll('.modal-overlay').forEach((overlay) => {
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) {
+        overlay.classList.add('hidden');
+      }
+    });
+  });
+
+  // Spreadsheet import, template download, and export
   const fileInput = document.getElementById('spreadsheetFileInput') as HTMLInputElement | null;
   document.getElementById('btnImportExcel')?.addEventListener('click', () => fileInput?.click());
   document.getElementById('btnEmptyImport')?.addEventListener('click', () => fileInput?.click());
 
+  const handleDownloadTemplate = () => {
+    downloadRundownTemplate('CueTimer_Rundown_Template.xlsx');
+    showToast('Downloaded CueTimer_Rundown_Template.xlsx');
+  };
+  document.getElementById('btnDownloadTemplate')?.addEventListener('click', handleDownloadTemplate);
+  document.getElementById('btnEmptyTemplate')?.addEventListener('click', handleDownloadTemplate);
+
   fileInput?.addEventListener('change', (e) => {
-    const files = (e.target as HTMLInputElement).files;
+    const inputEl = e.target as HTMLInputElement;
+    const files = inputEl.files;
     if (!files || !files[0]) return;
     const file = files[0];
     const reader = new FileReader();
     reader.onload = (evt) => {
       try {
         const buffer = evt.target?.result as ArrayBuffer;
-        const cues = parseSpreadsheet(buffer);
-        if (!cues.length) {
+        const parsed = parseSpreadsheetWithMeta(buffer);
+        if (!parsed.cues.length) {
           showToast('No valid cue rows found.');
           return;
         }
-        state.cues = cues;
+        const fileBaseName = file.name.replace(/\.[^/.]+$/, '');
+        state.cues = parsed.cues;
+        state.eventName = parsed.eventTitle || fileBaseName || state.eventName;
+        if (parsed.eventStartTime) {
+          state.eventStartTime = parsed.eventStartTime;
+        }
         state.activeCueIndex = 0;
         state.isRunning = false;
         state.startedAtEpoch = null;
         state.accumulatedElapsedMs = 0;
-        commitState();
-        showToast(`Imported ${cues.length} cues from ${file.name}.`);
+        state.eventFirstStartedEpoch = null;
+        state.eventEndedEpoch = null;
+        state.scheduleOffsetSec = 0;
+        lastChimePlayedForCue = null;
+
+        const importedSnap = buildRundownSnapshot(state.eventName, 'import');
+        cachedLastRundown = importedSnap;
+        saveLastUsedRundown(importedSnap).catch(() => {});
+
+        commitState(true, false);
+        const startMsg = parsed.eventStartTime ? ` · Start set to ${parsed.eventStartTime}` : '';
+        showToast(`Imported ${parsed.cues.length} cues from ${file.name}${startMsg}`);
       } catch (err: any) {
         showToast('Import error: ' + err.message);
+      } finally {
+        inputEl.value = '';
       }
     };
     reader.readAsArrayBuffer(file);
@@ -989,8 +1498,9 @@ function setupEventHandlers(): void {
 
   document.getElementById('btnExportRundown')?.addEventListener('click', () => {
     const metrics = computeMetrics();
-    exportRundownToExcel(state.cues, metrics, 'CueTimer_Rundown.xlsx');
-    showToast('Exported CueTimer_Rundown.xlsx');
+    const safeBase = (state.eventName || 'CueTimer_Rundown').replace(/[^a-zA-Z0-9_-]+/g, '_');
+    exportRundownToExcel(state.cues, metrics, `${safeBase}.xlsx`);
+    showToast(`Exported ${safeBase}.xlsx`);
   });
 
   // Add, Restore Sample, Clear
@@ -1014,11 +1524,17 @@ function setupEventHandlers(): void {
   document.getElementById('btnEmptyAdd')?.addEventListener('click', addCue);
 
   function loadSample() {
+    state.eventName = 'Main Stage Event';
+    state.eventStartTime = '09:00';
     state.cues = buildDefaultCues();
     state.activeCueIndex = 0;
     state.isRunning = false;
     state.startedAtEpoch = null;
     state.accumulatedElapsedMs = 0;
+    state.eventFirstStartedEpoch = null;
+    state.eventEndedEpoch = null;
+    state.scheduleOffsetSec = 0;
+    lastChimePlayedForCue = null;
     commitState();
     showToast('Loaded 5-cue sample rundown.');
   }
@@ -1027,11 +1543,12 @@ function setupEventHandlers(): void {
 
   document.getElementById('btnClearRundown')?.addEventListener('click', () => {
     state.cues = [];
+    state.activeCueIndex = 0;
     state.isRunning = false;
     state.startedAtEpoch = null;
     state.accumulatedElapsedMs = 0;
-    commitState();
-    showToast('Rundown cleared.');
+    commitState(true, false);
+    showToast('Rundown cleared. Use "Load Last" to restore your previous rundown.');
   });
 
   // Speaker flash messages
@@ -1051,14 +1568,14 @@ function setupEventHandlers(): void {
       visible: true,
       dismissedOnStage: false
     };
-    commitState();
+    commitState(true, false);
   }
 
   document.getElementById('btnSendStageMessage')?.addEventListener('click', () => broadcastFlash());
   document.getElementById('btnClearStageMessage')?.addEventListener('click', () => {
     if (speakerInput) speakerInput.value = '';
     state.flashMessage = { text: '', blinking: false, visible: false, dismissedOnStage: false };
-    commitState();
+    commitState(true, false);
   });
 
   document.querySelectorAll('.preset-msg-btn[data-preset-msg]').forEach((btn) => {
@@ -1069,44 +1586,106 @@ function setupEventHandlers(): void {
 
   document.getElementById('btnDismissStageFlash')?.addEventListener('click', () => {
     state.flashMessage.dismissedOnStage = true;
-    commitState();
-  });
-
-  // Global Keyboard Shortcuts
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-      closeOvertimeModal();
-      inlineForm?.classList.add('hidden');
-      timerBtn?.classList.remove('hidden');
-      return;
-    }
-
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-      e.preventDefault();
-      document.getElementById('btnUndo')?.click();
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
-      e.preventDefault();
-      document.getElementById('btnRedo')?.click();
-      return;
-    }
-
-    const targetTag = (document.activeElement?.tagName || '').toUpperCase();
-    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(targetTag)) return;
-
-    if (e.code === 'Space') {
-      e.preventDefault();
-      toggleStartPause();
-    } else if (e.key === 'ArrowRight') {
-      e.preventDefault();
-      requestNextCue();
-    } else if (e.key === 'ArrowLeft') {
-      e.preventDefault();
-      requestPrevCue();
-    }
+    commitState(false, false);
   });
 }
+
+// Single Global Keyboard Shortcut Listener
+function handleGlobalKeyDown(e: KeyboardEvent): void {
+  const target = e.target as HTMLElement | null;
+  const action = resolveShortcutAction({
+    key: e.key,
+    code: e.code,
+    ctrlKey: e.ctrlKey,
+    metaKey: e.metaKey,
+    altKey: e.altKey,
+    shiftKey: e.shiftKey,
+    repeat: e.repeat,
+    targetTagName: target?.tagName || '',
+    isContentEditable: Boolean(target?.isContentEditable)
+  });
+
+  if (!action) return;
+
+  switch (action) {
+    case 'CLOSE_MODAL': {
+      closeAllModals();
+      document.getElementById('inlineTimerForm')?.classList.add('hidden');
+      document.getElementById('btnTimerClickEdit')?.classList.remove('hidden');
+      break;
+    }
+    case 'UNDO': {
+      e.preventDefault();
+      document.getElementById('btnUndo')?.click();
+      break;
+    }
+    case 'REDO': {
+      e.preventDefault();
+      document.getElementById('btnRedo')?.click();
+      break;
+    }
+    case 'TOGGLE_PLAY_PAUSE': {
+      e.preventDefault();
+      toggleStartPause();
+      break;
+    }
+    case 'NEXT_CUE': {
+      e.preventDefault();
+      requestNextCue();
+      break;
+    }
+    case 'PREV_CUE': {
+      e.preventDefault();
+      requestPrevCue();
+      break;
+    }
+    case 'RESET_CUE': {
+      e.preventDefault();
+      resetCurrentCue();
+      break;
+    }
+    case 'END_EVENT': {
+      e.preventDefault();
+      endEventPlayback();
+      break;
+    }
+    case 'ADJUST_PLUS': {
+      e.preventDefault();
+      adjustActiveCueDuration(state.adjustStepSec);
+      break;
+    }
+    case 'ADJUST_MINUS': {
+      e.preventDefault();
+      adjustActiveCueDuration(-state.adjustStepSec);
+      break;
+    }
+    case 'TOGGLE_MUTE': {
+      e.preventDefault();
+      const isMuted = audioEngine.toggleMute();
+      showToast(isMuted ? 'Sound muted.' : 'Sound unmuted.');
+      renderFullUI();
+      break;
+    }
+    case 'TOGGLE_FULLSCREEN': {
+      if (currentRoute === 'stage') {
+        e.preventDefault();
+        if (!document.fullscreenElement) {
+          document.documentElement.requestFullscreen().catch(() => {});
+        } else {
+          document.exitFullscreen().catch(() => {});
+        }
+      }
+      break;
+    }
+    case 'TOGGLE_SHORTCUTS_HELP': {
+      e.preventDefault();
+      document.getElementById('shortcutsModal')?.classList.toggle('hidden');
+      break;
+    }
+  }
+}
+
+document.addEventListener('keydown', handleGlobalKeyDown);
 
 function renderAppForRoute(): void {
   currentRoute = getCurrentRoute();
@@ -1115,21 +1694,22 @@ function renderAppForRoute(): void {
 
   if (currentRoute === 'stage') {
     app.innerHTML = renderStageViewHtml();
-    document.title = 'CueTimer Stage Display';
+    document.title = 'CueTimer — Stage Display';
     requestScreenWakeLock().catch(() => {});
     syncEngine.announcePresence('stage');
   } else if (currentRoute === 'overlay') {
     app.innerHTML = renderOverlayViewHtml();
-    document.title = 'CueTimer Broadcast Overlay';
+    document.title = 'CueTimer — Broadcast Overlay';
     syncEngine.announcePresence('overlay');
   } else {
     app.innerHTML = renderOperatorViewHtml() + renderModalsHtml();
-    document.title = 'CueTimer: Real-Time Event Time Keeper & Cue Management';
+    document.title = 'CueTimer — Live Event Timing & Stage Control';
     releaseScreenWakeLock().catch(() => {});
     syncEngine.announcePresence('operator');
   }
 
-  setupEventHandlers();
+  setupRouteEventHandlers();
+  updateUndoRedoButtons();
   renderFullUI();
 }
 
@@ -1139,11 +1719,29 @@ window.addEventListener('hashchange', () => {
 });
 
 syncEngine.onStateChange((incomingState) => {
-  state = incomingState;
+  state = normalizeRestoredState(incomingState);
   renderFullUI();
 });
 
 renderAppForRoute();
+
+// Hydrate from IndexedDB asynchronously if available and sync cache
+Promise.all([loadEventFromDb('current_active_event'), loadLastUsedRundown()])
+  .then(([dbState, dbLast]) => {
+    if (dbLast) {
+      cachedLastRundown = dbLast;
+    }
+    if (dbState && !loadActiveEventSync()) {
+      state = normalizeRestoredState(dbState);
+      renderFullUI();
+    } else {
+      const btnLoadLast = document.getElementById('btnLoadLastRundown') as HTMLButtonElement | null;
+      if (btnLoadLast && cachedLastRundown?.cues.length) {
+        btnLoadLast.disabled = false;
+      }
+    }
+  })
+  .catch(() => {});
 
 // 100ms drift-free tick loop
 setInterval(() => {
@@ -1157,6 +1755,6 @@ setInterval(() => {
   const badge = document.getElementById('syncStatusBadge');
   if (badge) {
     const count = syncEngine.getConnectedPeers().length;
-    badge.textContent = `Sync Active (${count} Connected)`;
+    badge.textContent = `${count} stage ${count === 1 ? 'window' : 'windows'} connected`;
   }
 }, 2000);

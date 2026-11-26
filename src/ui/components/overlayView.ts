@@ -1,19 +1,24 @@
 export function renderOverlayViewHtml(): string {
   return `
     <div id="overlayView" class="overlay-display-shell" aria-label="Broadcast Transparent Overlay">
+      <div class="overlay-top-nav">
+        <button type="button" id="btnBackToController" class="btn btn-sm" aria-label="Back to Operator Console">
+          Back to Operator
+        </button>
+      </div>
       <div id="overlayBox" class="overlay-lower-third">
-        <div style="display:flex;flex-direction:column;gap:2px;max-width:380px;">
-          <div id="overlayCueTitle" style="font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+        <div class="overlay-info-col">
+          <div id="overlayCueTitle" class="overlay-cue-title">
             Opening Remarks
           </div>
-          <div id="overlayCueSpeaker" style="font-size:12px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+          <div id="overlayCueSpeaker" class="overlay-cue-speaker">
             Event Host
           </div>
         </div>
 
-        <div style="display:flex;align-items:center;gap:12px;">
-          <span id="overlayStatusBadge" class="tag mono" style="font-size:11px;">LIVE</span>
-          <div id="overlayTimer" class="mono text-normal" style="font-size:28px;font-weight:700;letter-spacing:-0.02em;">
+        <div class="overlay-timer-col">
+          <span id="overlayStatusBadge" class="overlay-status-text mono">LIVE</span>
+          <div id="overlayTimer" class="mono text-normal overlay-timer-digits">
             05:00
           </div>
         </div>
